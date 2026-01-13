@@ -23,7 +23,7 @@ garak>=0.9.0                 # Garak LLM vulnerability scanner
 # Configuration & Environment
 # ----------------------------
 python-dotenv>=0.20.0        # Environment variable management
-pyyaml>=6.0                  # YAML configuration support
+PyYAML>=6.0               # YAML configuration support
 
 
 # Logging & Monitoring
