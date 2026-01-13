@@ -3,14 +3,19 @@
 Comprehensive Garak LLM Security Scanner Toolkit
 ===============================================
 
-A sophisticated toolkit for conducting comprehensive security assessments of Large Language Models (LLMs)
-using the Garak vulnerability scanner. This toolkit integrates all available probes and provides advanced
-scanning capabilities for identifying threats and vulnerabilities.
+A toolkit for conducting security assessments of LLMs using the Garak vulnerability scanner.
 
+Key Streamlit Cloud hardening:
+- Uses the *current* interpreter (sys.executable) instead of `python3`
+  so subprocess calls run inside the same venv Streamlit installed into.
+- Safer output directory handling + path normalization
+- Less fragile logging defaults (writes logs into output_dir when possible)
 
 License: Apache 2.0
-Requirements: garak, python>=3.10
+Requirements: garak, python>=3.10, PyYAML
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -18,24 +23,33 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
 import subprocess
-import yaml
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from enum import Enum
+from pathlib import Path
+from typing import Dict, List, Optional
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('garak_scanner.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+import yaml
+
+# ----------------------------
+# Logging
+# ----------------------------
+
+logger = logging.getLogger("garak_scanner_toolkit")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+
+
+# ----------------------------
+# Enums / Dataclasses
+# ----------------------------
 
 class ScanCategory(Enum):
     """Security scan categories based on threat types"""
@@ -48,6 +62,8 @@ class ScanCategory(Enum):
     ENCODING = "encoding"
     COMPREHENSIVE = "comprehensive"
     CUSTOM = "custom"
+    TEST = "test"
+
 
 class SeverityLevel(Enum):
     """Vulnerability severity levels"""
@@ -56,6 +72,7 @@ class SeverityLevel(Enum):
     MEDIUM = "medium"
     LOW = "low"
     INFO = "info"
+
 
 @dataclass
 class ProbeConfig:
@@ -66,6 +83,7 @@ class ProbeConfig:
     severity: SeverityLevel
     enabled: bool = True
     custom_params: Optional[Dict] = None
+
 
 @dataclass
 class ScanConfig:
@@ -82,14 +100,19 @@ class ScanConfig:
     exclude_probes: Optional[List[str]] = None
     api_keys: Optional[Dict[str, str]] = None
 
+
+# ----------------------------
+# Probe Registry
+# ----------------------------
+
 class GarakProbeRegistry:
-    """Registry of all available Garak probes organized by category"""
-    
-    def __init__(self):
+    """Registry of Garak probes organized by category"""
+
+    def __init__(self) -> None:
         self.probes = self._initialize_probes()
-    
+
     def _initialize_probes(self) -> Dict[str, List[ProbeConfig]]:
-        """Initialize the comprehensive probe registry"""
+        """Initialize a probe registry (static list)"""
         return {
             "jailbreaks": [
                 ProbeConfig("dan.Dan_11_0", "jailbreaks", "DAN 11.0 jailbreak attempt", SeverityLevel.HIGH),
@@ -117,7 +140,6 @@ class GarakProbeRegistry:
                 ProbeConfig("goodside", "jailbreaks", "Riley Goodside jailbreak collection", SeverityLevel.HIGH),
                 ProbeConfig("grandma", "jailbreaks", "Grandma exploit technique", SeverityLevel.MEDIUM),
             ],
-            
             "prompt_injection": [
                 ProbeConfig("promptinject.HijackHateHumans", "prompt_injection", "Hate humans injection", SeverityLevel.CRITICAL),
                 ProbeConfig("promptinject.HijackHateHumansMini", "prompt_injection", "Mini hate humans injection", SeverityLevel.HIGH),
@@ -127,7 +149,6 @@ class GarakProbeRegistry:
                 ProbeConfig("promptinject.HijackLongPromptMini", "prompt_injection", "Mini long prompt hijacking", SeverityLevel.MEDIUM),
                 ProbeConfig("latentinjection", "prompt_injection", "Latent injection attacks", SeverityLevel.HIGH),
             ],
-            
             "encoding": [
                 ProbeConfig("encoding.InjectBase64", "encoding", "Base64 encoding injection", SeverityLevel.HIGH),
                 ProbeConfig("encoding.InjectBase32", "encoding", "Base32 encoding injection", SeverityLevel.HIGH),
@@ -142,7 +163,6 @@ class GarakProbeRegistry:
                 ProbeConfig("encoding.InjectROT13", "encoding", "ROT13 encoding injection", SeverityLevel.LOW),
                 ProbeConfig("encoding.InjectUU", "encoding", "UUencoding injection", SeverityLevel.MEDIUM),
             ],
-            
             "toxicity": [
                 ProbeConfig("atkgen.Tox", "toxicity", "Automated toxicity generation", SeverityLevel.CRITICAL),
                 ProbeConfig("realtoxicityprompts", "toxicity", "Real toxicity prompts dataset", SeverityLevel.HIGH),
@@ -155,14 +175,12 @@ class GarakProbeRegistry:
                 ProbeConfig("continuation.ContinueSlursReclaimedSlurs", "toxicity", "Slur continuation test", SeverityLevel.HIGH),
                 ProbeConfig("continuation.ContinueSlursReclaimedSlursMini", "toxicity", "Mini slur continuation", SeverityLevel.MEDIUM),
             ],
-            
             "malware": [
                 ProbeConfig("malwaregen.TopLevel", "malware", "High-level malware generation", SeverityLevel.CRITICAL),
                 ProbeConfig("malwaregen.Payload", "malware", "Malware payload generation", SeverityLevel.CRITICAL),
                 ProbeConfig("malwaregen.SubFunctions", "malware", "Malware subfunctions", SeverityLevel.HIGH),
                 ProbeConfig("malwaregen.Evasion", "malware", "Anti-detection evasion code", SeverityLevel.HIGH),
             ],
-            
             "data_leakage": [
                 ProbeConfig("leakreplay.GuardianCloze", "data_leakage", "Guardian dataset cloze test", SeverityLevel.HIGH),
                 ProbeConfig("leakreplay.GuardianComplete", "data_leakage", "Guardian dataset completion", SeverityLevel.HIGH),
@@ -175,7 +193,6 @@ class GarakProbeRegistry:
                 ProbeConfig("leakreplay.PotterCloze", "data_leakage", "Harry Potter cloze test", SeverityLevel.LOW),
                 ProbeConfig("leakreplay.PotterComplete", "data_leakage", "Harry Potter completion", SeverityLevel.LOW),
             ],
-            
             "hallucination": [
                 ProbeConfig("snowball", "hallucination", "Snowball hallucination test", SeverityLevel.MEDIUM),
                 ProbeConfig("packagehallucination.Python", "hallucination", "Python package hallucination", SeverityLevel.HIGH),
@@ -184,7 +201,6 @@ class GarakProbeRegistry:
                 ProbeConfig("packagehallucination.Rust", "hallucination", "Rust crate hallucination", SeverityLevel.HIGH),
                 ProbeConfig("misleading.FalseAssertion50", "hallucination", "False assertions test", SeverityLevel.MEDIUM),
             ],
-            
             "specialized": [
                 ProbeConfig("xss", "specialized", "Cross-site scripting vulnerabilities", SeverityLevel.CRITICAL),
                 ProbeConfig("donotanswer.DiscriminationExclusionToxicityHatefulOffensive", "specialized", "Discrimination content", SeverityLevel.HIGH),
@@ -207,331 +223,361 @@ class GarakProbeRegistry:
                 ProbeConfig("glitch", "specialized", "Glitch-based attacks", SeverityLevel.MEDIUM),
                 ProbeConfig("ansiescape", "specialized", "ANSI escape sequence attacks", SeverityLevel.LOW),
             ],
-            
             "antivirus_spam": [
                 ProbeConfig("av_spam_scanning.EICAR", "antivirus_spam", "EICAR test string", SeverityLevel.LOW),
                 ProbeConfig("av_spam_scanning.GTUBE", "antivirus_spam", "GTUBE spam test", SeverityLevel.LOW),
                 ProbeConfig("av_spam_scanning.GTphish", "antivirus_spam", "GTphish phishing test", SeverityLevel.LOW),
             ],
-            
             "test": [
                 ProbeConfig("test.Test", "test", "Basic functionality test", SeverityLevel.INFO),
-            ]
+            ],
         }
-    
+
     def get_probes_by_category(self, categories: List[ScanCategory]) -> List[str]:
         """Get probe names filtered by categories"""
-        selected_probes = []
-        
+        selected: List[str] = []
+
         for category in categories:
             if category == ScanCategory.COMPREHENSIVE:
-                # Include all non-test probes for comprehensive scan
                 for cat_name, probes in self.probes.items():
                     if cat_name != "test":
-                        selected_probes.extend([p.name for p in probes if p.enabled])
+                        selected.extend([p.name for p in probes if p.enabled])
+
             elif category == ScanCategory.JAILBREAKS:
-                selected_probes.extend([p.name for p in self.probes["jailbreaks"] if p.enabled])
+                selected.extend([p.name for p in self.probes["jailbreaks"] if p.enabled])
+
             elif category == ScanCategory.PROMPT_INJECTION:
-                selected_probes.extend([p.name for p in self.probes["prompt_injection"] if p.enabled])
+                selected.extend([p.name for p in self.probes["prompt_injection"] if p.enabled])
+
             elif category == ScanCategory.DATA_LEAKAGE:
-                selected_probes.extend([p.name for p in self.probes["data_leakage"] if p.enabled])
+                selected.extend([p.name for p in self.probes["data_leakage"] if p.enabled])
+
             elif category == ScanCategory.TOXICITY:
-                selected_probes.extend([p.name for p in self.probes["toxicity"] if p.enabled])
+                selected.extend([p.name for p in self.probes["toxicity"] if p.enabled])
+
             elif category == ScanCategory.MALWARE:
-                selected_probes.extend([p.name for p in self.probes["malware"] if p.enabled])
+                selected.extend([p.name for p in self.probes["malware"] if p.enabled])
+
             elif category == ScanCategory.HALLUCINATION:
-                selected_probes.extend([p.name for p in self.probes["hallucination"] if p.enabled])
+                selected.extend([p.name for p in self.probes["hallucination"] if p.enabled])
+
             elif category == ScanCategory.ENCODING:
-                selected_probes.extend([p.name for p in self.probes["encoding"] if p.enabled])
-        
-        return list(set(selected_probes))  # Remove duplicates
+                selected.extend([p.name for p in self.probes["encoding"] if p.enabled])
+
+            elif category == ScanCategory.TEST:
+                selected.extend([p.name for p in self.probes["test"] if p.enabled])
+
+        # Remove duplicates while preserving order-ish
+        return list(dict.fromkeys(selected))
+
+
+# ----------------------------
+# Scanner
+# ----------------------------
 
 class GarakScanner:
-    """Advanced Garak scanner with comprehensive security testing capabilities"""
-    
+    """Advanced Garak scanner wrapper that shells out to garak via -m"""
+
     def __init__(self, config: ScanConfig):
         self.config = config
         self.probe_registry = GarakProbeRegistry()
-        self.results = {}
-        
-        # Set up environment variables for API keys
+
+        # API keys
         if config.api_keys:
-            for key, value in config.api_keys.items():
-                os.environ[key] = value
-        
-        # Ensure output directory exists
-        Path(config.output_dir).mkdir(parents=True, exist_ok=True)
-    
+            for k, v in config.api_keys.items():
+                if v:
+                    os.environ[k] = v
+
+        # Normalize & ensure output directory exists
+        out = Path(config.output_dir).expanduser().resolve()
+        out.mkdir(parents=True, exist_ok=True)
+        self.config.output_dir = str(out)
+
+        # Add a file logger in output_dir if possible
+        self._ensure_file_logging(out)
+
+    def _ensure_file_logging(self, output_dir: Path) -> None:
+        log_path = output_dir / "garak_scanner.log"
+        # Avoid duplicate file handlers
+        for h in logger.handlers:
+            if isinstance(h, logging.FileHandler):
+                return
+        try:
+            fh = logging.FileHandler(str(log_path))
+            fh.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+            logger.addHandler(fh)
+        except Exception:
+            # If filesystem is read-only or restricted, keep stdout logging only.
+            logger.warning("Could not create file log handler; continuing with stdout logging only.")
+
+    @staticmethod
+    def _py_executable() -> str:
+        """Return the running interpreter path (Streamlit Cloud-safe)."""
+        return sys.executable or "python"
+
     def _validate_environment(self) -> bool:
-        """Validate that garak is installed and accessible"""
+        """Validate garak is importable in the *current* environment."""
         try:
-            result = subprocess.run(['python3', '-m', 'garak', '--help'], 
-                                  capture_output=True, text=True, timeout=30)
-            if result.returncode == 0:
-                logger.info("Garak installation validated successfully")
-                return True
-            else:
-                logger.error(f"Garak validation failed: {result.stderr}")
-                return False
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logger.error(f"Failed to validate garak installation: {e}")
-            return False
-    
-    def _build_garak_command(self, probes: List[str]) -> List[str]:
-        """Build the garak command with specified parameters"""
-        cmd = [
-            'python3', '-m', 'garak',
-            '--model_type', self.config.model_type,
-            '--model_name', self.config.target_model,
-            '--report_prefix', os.path.join(self.config.output_dir, self.config.report_prefix),
-            '--generations', str(self.config.max_generations)
-        ]
-        
-        if probes:
-            cmd.extend(['--probes', ','.join(probes)])
-        
-        # Add exclude probes if specified
-        if self.config.exclude_probes:
-            cmd.extend(['--probe_exclude', ','.join(self.config.exclude_probes)])
-        
-        return cmd
-    
-    def run_scan_batch(self, probe_batch: List[str], batch_name: str) -> Dict:
-        """Run a batch of probes and return results"""
-        logger.info(f"Starting scan batch: {batch_name}")
-        logger.info(f"Probes in batch: {', '.join(probe_batch)}")
-        
-        cmd = self._build_garak_command(probe_batch)
-        
-        try:
-            start_time = time.time()
             result = subprocess.run(
-                cmd, 
-                capture_output=True, 
-                text=True, 
-                timeout=self.config.timeout,
-                cwd=os.getcwd()
+                [self._py_executable(), "-m", "garak", "--help"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=os.environ.copy(),
             )
-            
-            end_time = time.time()
-            scan_duration = end_time - start_time
-            
-            batch_result = {
-                'batch_name': batch_name,
-                'probes': probe_batch,
-                'duration': scan_duration,
-                'return_code': result.returncode,
-                'stdout': result.stdout,
-                'stderr': result.stderr,
-                'success': result.returncode == 0,
-                'timestamp': datetime.now().isoformat()
-            }
-            
             if result.returncode == 0:
-                logger.info(f"Batch {batch_name} completed successfully in {scan_duration:.2f}s")
-            else:
-                logger.error(f"Batch {batch_name} failed with return code {result.returncode}")
-                logger.error(f"Error output: {result.stderr}")
-            
-            return batch_result
-            
+                logger.info("Garak installation validated successfully (venv interpreter)")
+                return True
+            logger.error("Garak validation failed: %s", (result.stderr or result.stdout).strip())
+            return False
         except subprocess.TimeoutExpired:
-            logger.error(f"Batch {batch_name} timed out after {self.config.timeout}s")
+            logger.error("Garak validation timed out")
+            return False
+        except FileNotFoundError as e:
+            logger.error("Interpreter not found for garak validation: %s", e)
+            return False
+        except Exception as e:
+            logger.error("Unexpected error validating garak: %s", e)
+            return False
+
+    def _build_garak_command(self, probes: List[str]) -> List[str]:
+        """Build the garak command using sys.executable."""
+        report_prefix_path = str(Path(self.config.output_dir) / self.config.report_prefix)
+
+        cmd = [
+            self._py_executable(),
+            "-m",
+            "garak",
+            "--model_type",
+            self.config.model_type,
+            "--model_name",
+            self.config.target_model,
+            "--report_prefix",
+            report_prefix_path,
+            "--generations",
+            str(self.config.max_generations),
+        ]
+
+        if probes:
+            cmd.extend(["--probes", ",".join(probes)])
+
+        if self.config.exclude_probes:
+            cmd.extend(["--probe_exclude", ",".join(self.config.exclude_probes)])
+
+        return cmd
+
+    def run_scan_batch(self, probe_batch: List[str], batch_name: str) -> Dict:
+        """Run a batch of probes and return results."""
+        logger.info("Starting scan batch: %s", batch_name)
+        logger.info("Probes in batch: %s", ", ".join(probe_batch))
+
+        cmd = self._build_garak_command(probe_batch)
+
+        try:
+            start = time.time()
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout,
+                cwd=str(Path(self.config.output_dir)),  # keep outputs/logs contained
+                env=os.environ.copy(),
+            )
+            duration = time.time() - start
+
+            batch_result = {
+                "batch_name": batch_name,
+                "probes": probe_batch,
+                "duration": duration,
+                "return_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "success": result.returncode == 0,
+                "timestamp": datetime.now().isoformat(),
+                "command": cmd,  # helpful for debugging
+            }
+
+            if batch_result["success"]:
+                logger.info("Batch %s completed successfully in %.2fs", batch_name, duration)
+            else:
+                logger.error("Batch %s failed (rc=%s)", batch_name, result.returncode)
+                if result.stderr:
+                    logger.error("stderr: %s", result.stderr[:2000])
+
+            return batch_result
+
+        except subprocess.TimeoutExpired:
+            logger.error("Batch %s timed out after %ss", batch_name, self.config.timeout)
             return {
-                'batch_name': batch_name,
-                'probes': probe_batch,
-                'duration': self.config.timeout,
-                'return_code': -1,
-                'stdout': '',
-                'stderr': 'Scan timed out',
-                'success': False,
-                'timestamp': datetime.now().isoformat()
+                "batch_name": batch_name,
+                "probes": probe_batch,
+                "duration": self.config.timeout,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": "Scan timed out",
+                "success": False,
+                "timestamp": datetime.now().isoformat(),
+                "command": cmd,
             }
         except Exception as e:
-            logger.error(f"Unexpected error in batch {batch_name}: {e}")
+            logger.error("Unexpected error in batch %s: %s", batch_name, e)
             return {
-                'batch_name': batch_name,
-                'probes': probe_batch,
-                'duration': 0,
-                'return_code': -1,
-                'stdout': '',
-                'stderr': str(e),
-                'success': False,
-                'timestamp': datetime.now().isoformat()
+                "batch_name": batch_name,
+                "probes": probe_batch,
+                "duration": 0,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": str(e),
+                "success": False,
+                "timestamp": datetime.now().isoformat(),
+                "command": cmd,
             }
-    
+
     def run_comprehensive_scan(self) -> Dict:
-        """Run a comprehensive security scan with all selected probe categories"""
+        """Run a comprehensive security scan with all selected probe categories."""
         if not self._validate_environment():
-            raise RuntimeError("Garak environment validation failed")
-        
-        logger.info("Starting comprehensive LLM security scan")
-        logger.info(f"Target: {self.config.model_type}:{self.config.target_model}")
-        logger.info(f"Categories: {[cat.value for cat in self.config.scan_categories]}")
-        
-        # Get probes based on selected categories
+            raise RuntimeError("Garak environment validation failed (is garak installed in this venv?)")
+
+        logger.info("Starting LLM security scan")
+        logger.info("Target: %s:%s", self.config.model_type, self.config.target_model)
+        logger.info("Categories: %s", [c.value for c in self.config.scan_categories])
+
         selected_probes = self.probe_registry.get_probes_by_category(self.config.scan_categories)
-        
-        # Add custom probes if specified
+
         if self.config.custom_probes:
             selected_probes.extend(self.config.custom_probes)
-        
-        # Remove excluded probes
+
         if self.config.exclude_probes:
             selected_probes = [p for p in selected_probes if p not in self.config.exclude_probes]
-        
-        logger.info(f"Total probes to run: {len(selected_probes)}")
-        
-        # Split probes into batches for parallel execution
-        batch_size = max(1, len(selected_probes) // self.config.parallel_probes)
-        probe_batches = [selected_probes[i:i + batch_size] 
-                        for i in range(0, len(selected_probes), batch_size)]
-        
-        # Convert config to dict with enum serialization
+
+        selected_probes = list(dict.fromkeys(selected_probes))
+        logger.info("Total probes to run: %s", len(selected_probes))
+
+        # Batch splitting
+        parallel = max(1, int(self.config.parallel_probes))
+        batch_size = max(1, (len(selected_probes) + parallel - 1) // parallel)
+        probe_batches = [selected_probes[i : i + batch_size] for i in range(0, len(selected_probes), batch_size)]
+
+        # Serialize config
         config_dict = asdict(self.config)
-        config_dict['scan_categories'] = [cat.value for cat in self.config.scan_categories]
-        
+        config_dict["scan_categories"] = [c.value for c in self.config.scan_categories]
+
         scan_results = {
-            'scan_config': config_dict,
-            'start_time': datetime.now().isoformat(),
-            'total_probes': len(selected_probes),
-            'batches': [],
-            'summary': {}
+            "scan_config": config_dict,
+            "start_time": datetime.now().isoformat(),
+            "total_probes": len(selected_probes),
+            "batches": [],
+            "summary": {},
         }
-        
-        # Run each batch
+
         for i, batch in enumerate(probe_batches):
             batch_name = f"batch_{i+1:03d}"
-            batch_result = self.run_scan_batch(batch, batch_name)
-            scan_results['batches'].append(batch_result)
-        
-        scan_results['end_time'] = datetime.now().isoformat()
-        scan_results['total_duration'] = sum(batch['duration'] for batch in scan_results['batches'])
-        scan_results['successful_batches'] = sum(1 for batch in scan_results['batches'] if batch['success'])
-        scan_results['failed_batches'] = len(scan_results['batches']) - scan_results['successful_batches']
-        
-        # Generate summary
-        scan_results['summary'] = self._generate_summary(scan_results)
-        
-        # Save comprehensive results
+            scan_results["batches"].append(self.run_scan_batch(batch, batch_name))
+
+        scan_results["end_time"] = datetime.now().isoformat()
+        scan_results["total_duration"] = sum(b["duration"] for b in scan_results["batches"])
+        scan_results["successful_batches"] = sum(1 for b in scan_results["batches"] if b["success"])
+        scan_results["failed_batches"] = len(scan_results["batches"]) - scan_results["successful_batches"]
+        scan_results["summary"] = self._generate_summary(scan_results)
+
         self._save_results(scan_results)
-        
         return scan_results
-    
-    def _generate_summary(self, scan_results: Dict) -> Dict:
-        """Generate a summary of scan results"""
-        summary = {
-            'total_batches': len(scan_results['batches']),
-            'successful_batches': scan_results['successful_batches'],
-            'failed_batches': scan_results['failed_batches'],
-            'success_rate': scan_results['successful_batches'] / len(scan_results['batches']) if scan_results['batches'] else 0,
-            'total_runtime': scan_results['total_duration'],
-            'average_batch_time': scan_results['total_duration'] / len(scan_results['batches']) if scan_results['batches'] else 0
+
+    @staticmethod
+    def _generate_summary(scan_results: Dict) -> Dict:
+        batches = scan_results.get("batches", [])
+        total = len(batches) or 1
+        total_dur = scan_results.get("total_duration", 0.0)
+        return {
+            "total_batches": len(batches),
+            "successful_batches": scan_results.get("successful_batches", 0),
+            "failed_batches": scan_results.get("failed_batches", 0),
+            "success_rate": (scan_results.get("successful_batches", 0) / total),
+            "total_runtime": total_dur,
+            "average_batch_time": (total_dur / total),
         }
-        
-        return summary
-    
-    def _save_results(self, results: Dict):
-        """Save scan results to files"""
+
+    def _save_results(self, results: Dict) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Save JSON results
-        json_path = os.path.join(self.config.output_dir, f"scan_results_{timestamp}.json")
-        with open(json_path, 'w') as f:
-            json.dump(results, f, indent=2)
-        
-        logger.info(f"Scan results saved to: {json_path}")
-        
-        # Generate human-readable report
-        report_path = os.path.join(self.config.output_dir, f"scan_report_{timestamp}.md")
-        self._generate_markdown_report(results, report_path)
-        
-        logger.info(f"Scan report saved to: {report_path}")
-    
-    def _generate_markdown_report(self, results: Dict, output_path: str):
-        """Generate a markdown report from scan results"""
-        report_content = f"""# LLM Security Scan Report
+        outdir = Path(self.config.output_dir)
 
-## Scan Configuration
-- **Target Model**: {results['scan_config']['model_type']}:{results['scan_config']['target_model']}
-- **Scan Categories**: {', '.join([cat for cat in results['scan_config']['scan_categories']])}
-- **Start Time**: {results['start_time']}
-- **End Time**: {results['end_time']}
-- **Total Duration**: {results['total_duration']:.2f} seconds
+        json_path = outdir / f"scan_results_{timestamp}.json"
+        json_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        logger.info("Scan results saved to: %s", json_path)
 
-## Summary
-- **Total Probes**: {results['total_probes']}
-- **Total Batches**: {results['summary']['total_batches']}
-- **Successful Batches**: {results['summary']['successful_batches']}
-- **Failed Batches**: {results['summary']['failed_batches']}
-- **Success Rate**: {results['summary']['success_rate']:.1%}
-- **Average Batch Time**: {results['summary']['average_batch_time']:.2f}s
+        report_path = outdir / f"scan_report_{timestamp}.md"
+        self._generate_markdown_report(results, str(report_path))
+        logger.info("Scan report saved to: %s", report_path)
 
-## Batch Results
+    def _generate_markdown_report(self, results: Dict, output_path: str) -> None:
+        report = []
+        report.append("# LLM Security Scan Report\n")
+        report.append("## Scan Configuration\n")
+        report.append(f"- **Target Model**: {results['scan_config']['model_type']}:{results['scan_config']['target_model']}\n")
+        report.append(f"- **Scan Categories**: {', '.join(results['scan_config']['scan_categories'])}\n")
+        report.append(f"- **Start Time**: {results['start_time']}\n")
+        report.append(f"- **End Time**: {results['end_time']}\n")
+        report.append(f"- **Total Duration**: {results['total_duration']:.2f} seconds\n\n")
 
-"""
-        
-        for batch in results['batches']:
-            status = "✅ SUCCESS" if batch['success'] else "❌ FAILED"
-            report_content += f"""### {batch['batch_name']} - {status}
-- **Duration**: {batch['duration']:.2f}s
-- **Return Code**: {batch['return_code']}
-- **Probes**: {', '.join(batch['probes'])}
+        report.append("## Summary\n")
+        report.append(f"- **Total Probes**: {results['total_probes']}\n")
+        report.append(f"- **Total Batches**: {results['summary']['total_batches']}\n")
+        report.append(f"- **Successful Batches**: {results['summary']['successful_batches']}\n")
+        report.append(f"- **Failed Batches**: {results['summary']['failed_batches']}\n")
+        report.append(f"- **Success Rate**: {results['summary']['success_rate']:.1%}\n")
+        report.append(f"- **Average Batch Time**: {results['summary']['average_batch_time']:.2f}s\n\n")
 
-"""
-            if not batch['success'] and batch['stderr']:
-                report_content += f"""**Error Output:**
-```
-{batch['stderr'][:500]}{'...' if len(batch['stderr']) > 500 else ''}
-```
+        report.append("## Batch Results\n\n")
+        for batch in results["batches"]:
+            status = "✅ SUCCESS" if batch["success"] else "❌ FAILED"
+            report.append(f"### {batch['batch_name']} - {status}\n")
+            report.append(f"- **Duration**: {batch['duration']:.2f}s\n")
+            report.append(f"- **Return Code**: {batch['return_code']}\n")
+            report.append(f"- **Probes**: {', '.join(batch['probes'])}\n\n")
+            if not batch["success"] and batch.get("stderr"):
+                stderr = batch["stderr"]
+                if len(stderr) > 800:
+                    stderr = stderr[:800] + "..."
+                report.append("**Error Output:**\n")
+                report.append("```\n" + stderr + "\n```\n\n")
 
-"""
-        
-        report_content += f"""## Recommendations
+        report.append("## Recommendations\n\n")
+        report.append("1. **Review Failed Batches**: Investigate probe batches that failed.\n")
+        report.append("2. **Analyze Garak Reports**: Review the JSONL/HTML reports Garak generates.\n")
+        report.append("3. **Prioritize Findings**: Address CRITICAL and HIGH findings first.\n")
+        report.append("4. **Retest**: Re-run relevant categories after fixes.\n\n")
+        report.append("---\n")
+        report.append("*Report generated by Garak LLM Security Scanner Toolkit*\n")
 
-Based on the scan results:
+        Path(output_path).write_text("".join(report), encoding="utf-8")
 
-1. **Review Failed Batches**: Investigate any failed probe batches for potential issues
-2. **Analyze Garak Reports**: Check the detailed JSONL reports generated by Garak in the output directory
-3. **Address Vulnerabilities**: Focus on CRITICAL and HIGH severity findings first
-4. **Retest**: After implementing fixes, rerun specific probe categories that showed vulnerabilities
 
-## Files Generated
-- Detailed JSON results: Available in the output directory
-- Garak JSONL reports: Check {results['scan_config']['output_dir']} for detailed probe results
-- HTML reports: Generated by Garak for each successful batch
+# ----------------------------
+# Config helpers
+# ----------------------------
 
----
-*Report generated by Garak LLM Security Scanner Toolkit*
-"""
-        
-        with open(output_path, 'w') as f:
-            f.write(report_content)
-
-def create_config_from_args(args) -> ScanConfig:
-    """Create scan configuration from command line arguments"""
-    scan_categories = []
-    
+def create_config_from_args(args: argparse.Namespace) -> ScanConfig:
+    scan_categories: List[ScanCategory] = []
     if args.category:
         for cat in args.category:
             try:
                 scan_categories.append(ScanCategory(cat))
             except ValueError:
-                logger.warning(f"Unknown category: {cat}")
-    
+                logger.warning("Unknown category: %s", cat)
+
     if not scan_categories:
         scan_categories = [ScanCategory.COMPREHENSIVE]
-    
-    api_keys = {}
+
+    api_keys: Dict[str, str] = {}
     if args.openai_key:
-        api_keys['OPENAI_API_KEY'] = args.openai_key
+        api_keys["OPENAI_API_KEY"] = args.openai_key
     if args.anthropic_key:
-        api_keys['ANTHROPIC_API_KEY'] = args.anthropic_key
+        api_keys["ANTHROPIC_API_KEY"] = args.anthropic_key
     if args.perspective_key:
-        api_keys['PERSPECTIVE_API_KEY'] = args.perspective_key
+        api_keys["PERSPECTIVE_API_KEY"] = args.perspective_key
     if args.cohere_key:
-        api_keys['COHERE_API_KEY'] = args.cohere_key
-    
+        api_keys["COHERE_API_KEY"] = args.cohere_key
+
     return ScanConfig(
         target_model=args.model_name,
         model_type=args.model_type,
@@ -541,355 +587,296 @@ def create_config_from_args(args) -> ScanConfig:
         max_generations=args.max_generations,
         timeout=args.timeout,
         parallel_probes=args.parallel_probes,
-        custom_probes=args.custom_probes.split(',') if args.custom_probes else None,
-        exclude_probes=args.exclude_probes.split(',') if args.exclude_probes else None,
-        api_keys=api_keys if api_keys else None
+        custom_probes=args.custom_probes.split(",") if args.custom_probes else None,
+        exclude_probes=args.exclude_probes.split(",") if args.exclude_probes else None,
+        api_keys=api_keys if api_keys else None,
     )
 
+
 def load_config_from_file(config_path: str) -> ScanConfig:
-    """Load scan configuration from YAML file"""
-    with open(config_path, 'r') as f:
-        config_data = yaml.safe_load(f)
-    
-    # Convert string categories to enum
-    categories = []
-    for cat in config_data.get('scan_categories', ['comprehensive']):
+    with open(config_path, "r", encoding="utf-8") as f:
+        config_data = yaml.safe_load(f) or {}
+
+    categories: List[ScanCategory] = []
+    for cat in config_data.get("scan_categories", ["comprehensive"]):
         try:
             categories.append(ScanCategory(cat))
         except ValueError:
-            logger.warning(f"Unknown category in config: {cat}")
-    
+            logger.warning("Unknown category in config: %s", cat)
+
     return ScanConfig(
-        target_model=config_data['target_model'],
-        model_type=config_data['model_type'],
-        scan_categories=categories,
-        output_dir=config_data.get('output_dir', './garak_results'),
-        report_prefix=config_data.get('report_prefix', 'scan'),
-        max_generations=config_data.get('max_generations', 10),
-        timeout=config_data.get('timeout', 3600),
-        parallel_probes=config_data.get('parallel_probes', 1),
-        custom_probes=config_data.get('custom_probes'),
-        exclude_probes=config_data.get('exclude_probes'),
-        api_keys=config_data.get('api_keys')
+        target_model=config_data["target_model"],
+        model_type=config_data["model_type"],
+        scan_categories=categories or [ScanCategory.COMPREHENSIVE],
+        output_dir=config_data.get("output_dir", "./garak_results"),
+        report_prefix=config_data.get("report_prefix", "scan"),
+        max_generations=int(config_data.get("max_generations", 10)),
+        timeout=int(config_data.get("timeout", 3600)),
+        parallel_probes=int(config_data.get("parallel_probes", 1)),
+        custom_probes=config_data.get("custom_probes"),
+        exclude_probes=config_data.get("exclude_probes"),
+        api_keys=config_data.get("api_keys"),
     )
 
-def generate_sample_config():
-    """Generate a sample configuration file"""
+
+def generate_sample_config() -> None:
     sample_config = {
-        'target_model': 'gpt-3.5-turbo',
-        'model_type': 'openai',
-        'scan_categories': ['jailbreaks', 'prompt_injection', 'toxicity'],
-        'output_dir': './garak_results',
-        'report_prefix': 'security_scan',
-        'max_generations': 10,
-        'timeout': 3600,
-        'parallel_probes': 2,
-        'custom_probes': None,
-        'exclude_probes': ['test.Test'],
-        'api_keys': {
-            'OPENAI_API_KEY': 'your_openai_key_here',
-            'PERSPECTIVE_API_KEY': 'your_perspective_key_here'
-        }
+        "target_model": "gpt-3.5-turbo",
+        "model_type": "openai",
+        "scan_categories": ["jailbreaks", "prompt_injection", "toxicity"],
+        "output_dir": "./garak_results",
+        "report_prefix": "security_scan",
+        "max_generations": 10,
+        "timeout": 3600,
+        "parallel_probes": 2,
+        "custom_probes": None,
+        "exclude_probes": ["test.Test"],
+        "api_keys": {
+            "OPENAI_API_KEY": "your_openai_key_here",
+            "PERSPECTIVE_API_KEY": "your_perspective_key_here",
+        },
     }
-    
-    with open('garak_config_sample.yaml', 'w') as f:
-        yaml.dump(sample_config, f, default_flow_style=False, indent=2)
-    
+
+    Path("garak_config_sample.yaml").write_text(
+        yaml.dump(sample_config, default_flow_style=False, indent=2),
+        encoding="utf-8",
+    )
     print("Sample configuration file generated: garak_config_sample.yaml")
 
+
+# ----------------------------
+# Analyzer (kept as in your original)
+# ----------------------------
+
 class GarakAnalyzer:
-    """Advanced analyzer for Garak scan results"""
-    
+    """Analyzer for Garak JSONL reports"""
+
     def __init__(self, results_dir: str):
         self.results_dir = Path(results_dir)
         self.probe_registry = GarakProbeRegistry()
-    
+
     def analyze_jsonl_reports(self) -> Dict:
-        """Analyze JSONL reports generated by Garak"""
         jsonl_files = list(self.results_dir.glob("*.jsonl"))
-        
         if not jsonl_files:
             logger.warning("No JSONL report files found")
             return {}
-        
+
         analysis = {
-            'total_files': len(jsonl_files),
-            'vulnerability_summary': {},
-            'probe_results': {},
-            'severity_breakdown': {level.value: 0 for level in SeverityLevel},
-            'recommendations': []
+            "total_files": len(jsonl_files),
+            "vulnerability_summary": {},
+            "probe_results": {},
+            "severity_breakdown": {level.value: 0 for level in SeverityLevel},
+            "recommendations": [],
         }
-        
+
         total_vulnerabilities = 0
-        
+
         for jsonl_file in jsonl_files:
             file_analysis = self._analyze_single_jsonl(jsonl_file)
-            
-            # Aggregate results
-            for probe, results in file_analysis.get('probe_results', {}).items():
-                if probe not in analysis['probe_results']:
-                    analysis['probe_results'][probe] = {
-                        'total_attempts': 0,
-                        'failed_attempts': 0,
-                        'success_rate': 0,
-                        'vulnerabilities': []
+
+            for probe, results in file_analysis.get("probe_results", {}).items():
+                if probe not in analysis["probe_results"]:
+                    analysis["probe_results"][probe] = {
+                        "total_attempts": 0,
+                        "failed_attempts": 0,
+                        "success_rate": 0.0,
+                        "vulnerabilities": [],
                     }
-                
-                probe_data = analysis['probe_results'][probe]
-                probe_data['total_attempts'] += results['total_attempts']
-                probe_data['failed_attempts'] += results['failed_attempts']
-                probe_data['vulnerabilities'].extend(results['vulnerabilities'])
-            
-            total_vulnerabilities += file_analysis.get('total_vulnerabilities', 0)
-        
-        # Calculate success rates and severity breakdown
-        for probe, data in analysis['probe_results'].items():
-            if data['total_attempts'] > 0:
-                data['success_rate'] = (data['failed_attempts'] / data['total_attempts']) * 100
-            
-            # Get probe severity
+                probe_data = analysis["probe_results"][probe]
+                probe_data["total_attempts"] += results["total_attempts"]
+                probe_data["failed_attempts"] += results["failed_attempts"]
+                probe_data["vulnerabilities"].extend(results["vulnerabilities"])
+
+            total_vulnerabilities += file_analysis.get("total_vulnerabilities", 0)
+
+        for probe, data in analysis["probe_results"].items():
+            if data["total_attempts"] > 0:
+                data["success_rate"] = (data["failed_attempts"] / data["total_attempts"]) * 100.0
+
             probe_config = self._find_probe_config(probe)
-            if probe_config and data['failed_attempts'] > 0:
-                analysis['severity_breakdown'][probe_config.severity.value] += data['failed_attempts']
-        
-        analysis['total_vulnerabilities'] = total_vulnerabilities
-        analysis['recommendations'] = self._generate_recommendations(analysis)
-        
+            if probe_config and data["failed_attempts"] > 0:
+                analysis["severity_breakdown"][probe_config.severity.value] += data["failed_attempts"]
+
+        analysis["total_vulnerabilities"] = total_vulnerabilities
+        analysis["recommendations"] = self._generate_recommendations(analysis)
         return analysis
-    
+
     def _analyze_single_jsonl(self, jsonl_path: Path) -> Dict:
-        """Analyze a single JSONL report file"""
-        probe_results = {}
+        probe_results: Dict[str, Dict] = {}
         total_vulnerabilities = 0
-        
+
         try:
-            with open(jsonl_path, 'r') as f:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line in f:
-                    if line.strip():
-                        try:
-                            record = json.loads(line)
-                            
-                            probe_name = record.get('probe', 'unknown')
-                            status = record.get('status', 'unknown')
-                            
-                            if probe_name not in probe_results:
-                                probe_results[probe_name] = {
-                                    'total_attempts': 0,
-                                    'failed_attempts': 0,
-                                    'vulnerabilities': []
-                                }
-                            
-                            probe_results[probe_name]['total_attempts'] += 1
-                            
-                            # Check if this represents a vulnerability
-                            if status == 'FAIL' or record.get('score', 0) > 0:
-                                probe_results[probe_name]['failed_attempts'] += 1
-                                probe_results[probe_name]['vulnerabilities'].append({
-                                    'prompt': record.get('prompt', ''),
-                                    'output': record.get('output', ''),
-                                    'score': record.get('score', 0),
-                                    'detector': record.get('detector', '')
-                                })
-                                total_vulnerabilities += 1
-                        
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"Failed to parse JSON line in {jsonl_path}: {e}")
-                            continue
-        
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        logger.warning("Failed to parse JSON line in %s: %s", jsonl_path, e)
+                        continue
+
+                    probe_name = record.get("probe", "unknown")
+                    status = record.get("status", "unknown")
+
+                    probe_results.setdefault(
+                        probe_name,
+                        {"total_attempts": 0, "failed_attempts": 0, "vulnerabilities": []},
+                    )
+                    probe_results[probe_name]["total_attempts"] += 1
+
+                    if status == "FAIL" or record.get("score", 0) > 0:
+                        probe_results[probe_name]["failed_attempts"] += 1
+                        probe_results[probe_name]["vulnerabilities"].append(
+                            {
+                                "prompt": record.get("prompt", ""),
+                                "output": record.get("output", ""),
+                                "score": record.get("score", 0),
+                                "detector": record.get("detector", ""),
+                            }
+                        )
+                        total_vulnerabilities += 1
+
         except Exception as e:
-            logger.error(f"Error analyzing {jsonl_path}: {e}")
-        
+            logger.error("Error analyzing %s: %s", jsonl_path, e)
+
         return {
-            'file': str(jsonl_path),
-            'probe_results': probe_results,
-            'total_vulnerabilities': total_vulnerabilities
+            "file": str(jsonl_path),
+            "probe_results": probe_results,
+            "total_vulnerabilities": total_vulnerabilities,
         }
-    
+
     def _find_probe_config(self, probe_name: str) -> Optional[ProbeConfig]:
-        """Find probe configuration by name"""
         for category_probes in self.probe_registry.probes.values():
             for probe_config in category_probes:
                 if probe_config.name == probe_name:
                     return probe_config
         return None
-    
+
     def _generate_recommendations(self, analysis: Dict) -> List[str]:
-        """Generate security recommendations based on analysis"""
-        recommendations = []
-        
-        total_vulns = analysis['total_vulnerabilities']
+        recommendations: List[str] = []
+        total_vulns = analysis.get("total_vulnerabilities", 0)
+
         if total_vulns == 0:
-            recommendations.append("✅ No vulnerabilities detected in the current scan")
-            return recommendations
-        
-        severity_breakdown = analysis['severity_breakdown']
-        
-        if severity_breakdown['critical'] > 0:
-            recommendations.append(f"🚨 CRITICAL: {severity_breakdown['critical']} critical vulnerabilities found - immediate action required")
-        
-        if severity_breakdown['high'] > 0:
-            recommendations.append(f"⚠️ HIGH: {severity_breakdown['high']} high-severity vulnerabilities - address within 24-48 hours")
-        
-        if severity_breakdown['medium'] > 0:
-            recommendations.append(f"🔶 MEDIUM: {severity_breakdown['medium']} medium-severity vulnerabilities - address within 1 week")
-        
-        # Specific recommendations based on probe types
-        vulnerable_probes = {k: v for k, v in analysis['probe_results'].items() 
-                           if v['failed_attempts'] > 0}
-        
-        if any('dan.' in probe for probe in vulnerable_probes):
+            return ["✅ No vulnerabilities detected in the current scan"]
+
+        sev = analysis.get("severity_breakdown", {})
+        if sev.get("critical", 0) > 0:
+            recommendations.append(f"🚨 CRITICAL: {sev['critical']} critical vulnerabilities found - immediate action required")
+        if sev.get("high", 0) > 0:
+            recommendations.append(f"⚠️ HIGH: {sev['high']} high-severity vulnerabilities - address within 24-48 hours")
+        if sev.get("medium", 0) > 0:
+            recommendations.append(f"🔶 MEDIUM: {sev['medium']} medium-severity vulnerabilities - address within 1 week")
+
+        vulnerable_probes = {k: v for k, v in analysis.get("probe_results", {}).items() if v.get("failed_attempts", 0) > 0}
+
+        if any("dan." in probe for probe in vulnerable_probes):
             recommendations.append("🔒 Implement stronger jailbreak defenses - DAN vulnerabilities detected")
-        
-        if any('malwaregen.' in probe for probe in vulnerable_probes):
+        if any("malwaregen." in probe for probe in vulnerable_probes):
             recommendations.append("🛡️ Add malware generation filters - model generates potentially harmful code")
-        
-        if any('promptinject.' in probe for probe in vulnerable_probes):
+        if any("promptinject." in probe for probe in vulnerable_probes):
             recommendations.append("🎯 Strengthen prompt injection defenses - injection attacks successful")
-        
-        if any('encoding.' in probe for probe in vulnerable_probes):
+        if any("encoding." in probe for probe in vulnerable_probes):
             recommendations.append("🔤 Implement encoding-aware input validation - bypass techniques working")
-        
-        if any('leakreplay.' in probe for probe in vulnerable_probes):
+        if any("leakreplay." in probe for probe in vulnerable_probes):
             recommendations.append("🔐 Review training data exposure - potential data leakage detected")
-        
+
         recommendations.append("📊 Run follow-up scans after implementing fixes to verify improvements")
-        
         return recommendations
-    
+
     def generate_detailed_report(self, output_path: str):
-        """Generate a detailed analysis report"""
         analysis = self.analyze_jsonl_reports()
-        
-        report_content = f"""# Detailed Garak Security Analysis Report
+        if not analysis:
+            Path(output_path).write_text("# Detailed Garak Security Analysis Report\n\nNo JSONL files found.\n", encoding="utf-8")
+            logger.info("Detailed analysis report saved to: %s", output_path)
+            return
 
-## Executive Summary
-- **Total Vulnerabilities Found**: {analysis['total_vulnerabilities']}
-- **Files Analyzed**: {analysis['total_files']}
-- **Report Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        report_content = [
+            "# Detailed Garak Security Analysis Report\n\n",
+            "## Executive Summary\n",
+            f"- **Total Vulnerabilities Found**: {analysis.get('total_vulnerabilities', 0)}\n",
+            f"- **Files Analyzed**: {analysis.get('total_files', 0)}\n",
+            f"- **Report Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n",
+            "## Severity Breakdown\n",
+        ]
 
-## Severity Breakdown
-"""
-        
-        for severity, count in analysis['severity_breakdown'].items():
+        for severity, count in analysis.get("severity_breakdown", {}).items():
             if count > 0:
-                emoji = {'critical': '🚨', 'high': '⚠️', 'medium': '🔶', 'low': '🔵', 'info': 'ℹ️'}.get(severity, '•')
-                report_content += f"- **{severity.upper()}**: {count} {emoji}\n"
-        
-        report_content += "\n## Probe Results\n\n"
-        
-        for probe, data in analysis['probe_results'].items():
-            if data['failed_attempts'] > 0:
-                probe_config = self._find_probe_config(probe)
-                severity = probe_config.severity.value if probe_config else 'unknown'
-                
-                report_content += f"""### {probe} ({severity})
-- **Total Attempts**: {data['total_attempts']}
-- **Failed Attempts**: {data['failed_attempts']}
-- **Failure Rate**: {data['success_rate']:.1f}%
-- **Description**: {probe_config.description if probe_config else 'N/A'}
+                emoji = {"critical": "🚨", "high": "⚠️", "medium": "🔶", "low": "🔵", "info": "ℹ️"}.get(severity, "•")
+                report_content.append(f"- **{severity.upper()}**: {count} {emoji}\n")
 
-"""
-        
-        report_content += "\n## Recommendations\n\n"
-        for i, rec in enumerate(analysis['recommendations'], 1):
-            report_content += f"{i}. {rec}\n"
-        
-        report_content += f"""
-## Next Steps
+        report_content.append("\n## Recommendations\n\n")
+        for i, rec in enumerate(analysis.get("recommendations", []), 1):
+            report_content.append(f"{i}. {rec}\n")
 
-1. **Prioritize Critical Issues**: Address all CRITICAL and HIGH severity vulnerabilities immediately
-2. **Implement Defenses**: Add appropriate input validation, output filtering, and safety measures
-3. **Monitor**: Set up regular security scanning as part of your CI/CD pipeline
-4. **Test**: Verify fixes by re-running specific probe categories
-5. **Document**: Keep records of vulnerabilities found and remediation steps taken
+        Path(output_path).write_text("".join(report_content), encoding="utf-8")
+        logger.info("Detailed analysis report saved to: %s", output_path)
 
----
-*Detailed analysis generated by Garak LLM Security Scanner Toolkit*
-"""
-        
-        with open(output_path, 'w') as f:
-            f.write(report_content)
-        
-        logger.info(f"Detailed analysis report saved to: {output_path}")
 
-def main():
-    """Main function with comprehensive CLI interface"""
+# ----------------------------
+# CLI
+# ----------------------------
+
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="Comprehensive Garak LLM Security Scanner Toolkit",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic scan with default settings
-  python garak_scanner.py --model-type openai --model-name gpt-3.5-turbo
-  
-  # Comprehensive security audit
-  python garak_scanner.py --model-type huggingface --model-name gpt2 --category comprehensive
-  
-  # Specific category testing
-  python garak_scanner.py --model-type openai --model-name gpt-4 --category jailbreaks toxicity
-  
-  # Load configuration from file
-  python garak_scanner.py --config config.yaml
-  
-  # Generate sample configuration
-  python garak_scanner.py --generate-config
-  
-  # Analyze existing results
-  python garak_scanner.py --analyze ./results
-"""
+  python garak_scanner_toolkit.py --model-type openai --model-name gpt-3.5-turbo
+  python garak_scanner_toolkit.py --model-type huggingface --model-name gpt2 --category comprehensive
+  python garak_scanner_toolkit.py --model-type openai --model-name gpt-4 --category jailbreaks toxicity
+  python garak_scanner_toolkit.py --config config.yaml
+  python garak_scanner_toolkit.py --generate-config
+  python garak_scanner_toolkit.py --analyze ./results
+""",
     )
-    
-    # Configuration options
-    config_group = parser.add_argument_group('Configuration')
-    config_group.add_argument('--config', type=str, help='Load configuration from YAML file')
-    config_group.add_argument('--generate-config', action='store_true', help='Generate sample configuration file')
-    
-    # Model options
-    model_group = parser.add_argument_group('Model Configuration')
-    model_group.add_argument('--model-type', type=str, 
-                           choices=['openai', 'huggingface', 'anthropic', 'cohere', 'replicate', 'ollama', 'test'],
-                           help='Type of model to scan')
-    model_group.add_argument('--model-name', type=str, help='Specific model name to scan')
-    
-    # Scan options
-    scan_group = parser.add_argument_group('Scan Configuration')
-    scan_group.add_argument('--category', type=str, nargs='+',
-                          choices=[cat.value for cat in ScanCategory],
-                          help='Security categories to test')
-    scan_group.add_argument('--custom-probes', type=str, help='Comma-separated list of custom probes')
-    scan_group.add_argument('--exclude-probes', type=str, help='Comma-separated list of probes to exclude')
-    scan_group.add_argument('--max-generations', type=int, default=10, help='Maximum generations per probe')
-    scan_group.add_argument('--timeout', type=int, default=3600, help='Timeout in seconds for each batch')
-    scan_group.add_argument('--parallel-probes', type=int, default=1, help='Number of parallel probe batches')
-    
-    # Output options
-    output_group = parser.add_argument_group('Output Configuration')
-    output_group.add_argument('--output-dir', type=str, default='./garak_results', help='Output directory for results')
-    output_group.add_argument('--report-prefix', type=str, default='scan', help='Prefix for report files')
-    
-    # API Keys
-    api_group = parser.add_argument_group('API Keys')
-    api_group.add_argument('--openai-key', type=str, help='OpenAI API key')
-    api_group.add_argument('--anthropic-key', type=str, help='Anthropic API key')
-    api_group.add_argument('--perspective-key', type=str, help='Perspective API key')
-    api_group.add_argument('--cohere-key', type=str, help='Cohere API key')
-    
-    # Analysis options
-    analysis_group = parser.add_argument_group('Analysis')
-    analysis_group.add_argument('--analyze', type=str, help='Analyze existing results in specified directory')
-    
-    # Utility options
-    utility_group = parser.add_argument_group('Utilities')
-    utility_group.add_argument('--list-probes', action='store_true', help='List all available probes by category')
-    utility_group.add_argument('--validate', action='store_true', help='Validate Garak installation')
-    
+
+    config_group = parser.add_argument_group("Configuration")
+    config_group.add_argument("--config", type=str, help="Load configuration from YAML file")
+    config_group.add_argument("--generate-config", action="store_true", help="Generate sample configuration file")
+
+    model_group = parser.add_argument_group("Model Configuration")
+    model_group.add_argument(
+        "--model-type",
+        type=str,
+        choices=["openai", "huggingface", "anthropic", "cohere", "replicate", "ollama", "test"],
+        help="Type of model to scan",
+    )
+    model_group.add_argument("--model-name", type=str, help="Specific model name to scan")
+
+    scan_group = parser.add_argument_group("Scan Configuration")
+    scan_group.add_argument("--category", type=str, nargs="+", choices=[c.value for c in ScanCategory], help="Categories to test")
+    scan_group.add_argument("--custom-probes", type=str, help="Comma-separated list of custom probes")
+    scan_group.add_argument("--exclude-probes", type=str, help="Comma-separated list of probes to exclude")
+    scan_group.add_argument("--max-generations", type=int, default=10, help="Maximum generations per probe")
+    scan_group.add_argument("--timeout", type=int, default=3600, help="Timeout in seconds for each batch")
+    scan_group.add_argument("--parallel-probes", type=int, default=1, help="Number of parallel probe batches")
+
+    output_group = parser.add_argument_group("Output Configuration")
+    output_group.add_argument("--output-dir", type=str, default="./garak_results", help="Output directory for results")
+    output_group.add_argument("--report-prefix", type=str, default="scan", help="Prefix for report files")
+
+    api_group = parser.add_argument_group("API Keys")
+    api_group.add_argument("--openai-key", type=str, help="OpenAI API key")
+    api_group.add_argument("--anthropic-key", type=str, help="Anthropic API key")
+    api_group.add_argument("--perspective-key", type=str, help="Perspective API key")
+    api_group.add_argument("--cohere-key", type=str, help="Cohere API key")
+
+    analysis_group = parser.add_argument_group("Analysis")
+    analysis_group.add_argument("--analyze", type=str, help="Analyze existing results in specified directory")
+
+    utility_group = parser.add_argument_group("Utilities")
+    utility_group.add_argument("--list-probes", action="store_true", help="List all available probes by category")
+    utility_group.add_argument("--validate", action="store_true", help="Validate Garak installation")
+
     args = parser.parse_args()
-    
-    # Handle utility commands
+
     if args.generate_config:
         generate_sample_config()
         return
-    
+
     if args.list_probes:
         registry = GarakProbeRegistry()
         print("\n=== Available Garak Probes by Category ===\n")
@@ -900,27 +887,30 @@ Examples:
                 print(f"  {status} {probe.name} - {probe.description} [{probe.severity.value}]")
             print()
         return
-    
+
     if args.validate:
-        scanner = GarakScanner(ScanConfig(
-            target_model="test", model_type="test", scan_categories=[ScanCategory.TEST],
-            output_dir="./test", report_prefix="test"
-        ))
-        if scanner._validate_environment():
-            print("✅ Garak installation is valid and ready to use")
-        else:
-            print("❌ Garak installation validation failed")
+        scanner = GarakScanner(
+            ScanConfig(
+                target_model="test",
+                model_type="test",
+                scan_categories=[ScanCategory.TEST],
+                output_dir="./test",
+                report_prefix="test",
+            )
+        )
+        ok = scanner._validate_environment()
+        print("✅ Garak installation is valid and ready to use" if ok else "❌ Garak installation validation failed")
         return
-    
+
     if args.analyze:
         analyzer = GarakAnalyzer(args.analyze)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        report_path = f"analysis_report_{timestamp}.md"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = f"analysis_report_{ts}.md"
         analyzer.generate_detailed_report(report_path)
         print(f"Analysis complete. Report saved to: {report_path}")
         return
-    
-    # Main scanning functionality
+
+    # Main scanning
     try:
         if args.config:
             config = load_config_from_file(args.config)
@@ -928,29 +918,29 @@ Examples:
             if not args.model_type or not args.model_name:
                 parser.error("--model-type and --model-name are required unless using --config")
             config = create_config_from_args(args)
-        
+
         scanner = GarakScanner(config)
         results = scanner.run_comprehensive_scan()
-        
-        print(f"\n=== Scan Complete ===")
+
+        print("\n=== Scan Complete ===")
         print(f"Total Duration: {results['total_duration']:.2f}s")
         print(f"Successful Batches: {results['successful_batches']}/{len(results['batches'])}")
         print(f"Results saved to: {config.output_dir}")
-        
-        # Automatically run analysis if scan completed successfully
-        if results['successful_batches'] > 0:
+
+        if results["successful_batches"] > 0:
             print("\n=== Running Analysis ===")
             analyzer = GarakAnalyzer(config.output_dir)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            analysis_path = os.path.join(config.output_dir, f"analysis_report_{timestamp}.md")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            analysis_path = str(Path(config.output_dir) / f"analysis_report_{ts}.md")
             analyzer.generate_detailed_report(analysis_path)
             print(f"Analysis report saved to: {analysis_path}")
-    
+
     except KeyboardInterrupt:
         logger.info("Scan interrupted by user")
     except Exception as e:
-        logger.error(f"Scan failed: {e}")
-        sys.exit(1)
+        logger.error("Scan failed: %s", e)
+        raise
+
 
 if __name__ == "__main__":
     main()
