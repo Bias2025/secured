@@ -13,8 +13,8 @@ streamlit-aggrid>=0.3.4      # Advanced grid components (optional)
 
 # Data Processing & Display
 # --------------------------
-pandas>=1.5.0                # Data manipulation and display
-numpy>=1.21.0                # Numerical operations
+pandas>=2.1.0                # Data manipulation and display
+numpy>=1.26.0                # Numerical operations
 
 # Garak Scanner Core
 # ------------------
@@ -39,7 +39,6 @@ google-generativeai>=0.3.0   # Google Gemini API client
 
 # Utilities
 # ---------
-pathlib>=1.0.1               # Path operations
 typing-extensions>=4.0.0     # Type hints
 
 # Optional Visualization
