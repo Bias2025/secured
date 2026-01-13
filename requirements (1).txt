@@ -1,0 +1,60 @@
+# Streamlit App Requirements for Garak LLM Security Scanner
+# ============================================================
+#
+# Install with: pip install -r requirements.txt
+#
+# This file contains only the essential dependencies for the Streamlit web app
+# For the full garak scanner toolkit, also install: pip install -r garak_requirements.txt
+
+# Core Web Framework
+# ------------------
+streamlit>=1.28.0            # Main web framework
+streamlit-aggrid>=0.3.4      # Advanced grid components (optional)
+
+# Data Processing & Display
+# --------------------------
+pandas>=1.5.0                # Data manipulation and display
+numpy>=1.21.0                # Numerical operations
+
+# Garak Scanner Core
+# ------------------
+garak>=0.9.0                 # Garak LLM vulnerability scanner
+
+# Configuration & Environment
+# ----------------------------
+python-dotenv>=0.20.0        # Environment variable management
+pyyaml>=6.0                  # YAML configuration support
+
+# Logging & Monitoring
+# --------------------
+colorlog>=6.7.0              # Enhanced logging with colors
+
+# API Clients (compatible with garak)
+# ---------------------------------------------
+openai<1.0.0,>=0.27.7        # OpenAI API client (compatible with garak)
+anthropic>=0.7.0             # Anthropic API client
+cohere>=4.0.0                # Cohere API client
+google-generativeai>=0.3.0   # Google Gemini API client
+
+# Utilities
+# ---------
+pathlib>=1.0.1               # Path operations
+typing-extensions>=4.0.0     # Type hints
+
+# Optional Visualization
+# ----------------------
+plotly>=5.10.0               # Interactive charts (optional)
+altair>=5.0.0                # Declarative visualizations (optional)
+
+# Production Dependencies
+# -----------------------
+watchdog>=2.1.0              # File system monitoring for hot reload
+requests>=2.28.0             # HTTP requests
+certifi>=2022.9.24           # SSL certificates
+
+# Development (Optional)
+# ----------------------
+# Uncomment for development
+# pytest>=7.1.0
+# black>=22.6.0
+# flake8>=5.0.0
