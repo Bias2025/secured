@@ -3,67 +3,67 @@
 SecureLLM Streamlit App (Garak-powered)
 ======================================
 
-This module contains the Streamlit UI and orchestration logic for running
-Garak scans in a safer, Streamlit-Cloud-friendly way.
+A Streamlit UI to run Garak scans in a Streamlit-Cloud-friendly way.
 
-Security goals (pragmatic, not perfect):
-- No arbitrary shell execution (we only invoke `python -m garak` via a controlled wrapper)
-- Constrained parameters (timeouts, generations, parallelism)
-- Output written to an app-owned directory under /tmp
-- Optional password gate via Streamlit Secrets
-- No secrets printed to logs/UI
+Security / ops goals:
+- No arbitrary shell execution (only `sys.executable -m garak` via GarakScanner wrapper)
+- Constrained scan parameters (timeouts, generations, parallelism)
+- Outputs written to an app-owned directory under /tmp (ephemeral on Streamlit Cloud)
+- Optional password gate via Streamlit Secrets (APP_PASSWORD)
+- No secrets printed to logs/UI (masked diagnostics only)
 
-Author: Isi Idemudia (original project) + deployment hardening
+Repo expectations:
+- model_registry.py provides ModelRegistry + ModelInfo
+- garak_scanner_toolkit.py provides GarakScanner, GarakProbeRegistry, ScanCategory, ScanConfig
+
 License: Apache 2.0
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
-import time
-import json
 import secrets
-from dataclasses import asdict
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
 
 from model_registry import ModelRegistry, ModelInfo
-from garak_scanner_toolkit import (
-    GarakScanner,
-    GarakProbeRegistry,
-    ScanCategory,
-    ScanConfig,
-)
+from garak_scanner_toolkit import GarakScanner, GarakProbeRegistry, ScanCategory, ScanConfig
 
 APP_NAME = "SecureLLM"
+
+# Streamlit Cloud: /tmp is writable, but ephemeral.
 DEFAULT_OUTPUT_ROOT = Path(os.environ.get("SECURELLM_OUTPUT_ROOT", "/tmp/securellm_runs"))
 DEFAULT_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-# -----------------------------
-# Security / validation helpers
-# -----------------------------
-
+# Providers we allow through the UI (defense-in-depth)
 _ALLOWED_MODEL_TYPES = {"openai", "anthropic", "google", "cohere", "huggingface", "replicate", "ollama", "test"}
 
-_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/\-]{0,127}$")  # conservative allowlist
+# Conservative allowlist for model names (avoid weird injection / path behavior)
+_MODEL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/\-]{0,127}$")
 
+
+# -----------------------------
+# Small utilities
+# -----------------------------
 
 def _safe_slug(s: str) -> str:
-    s = s.strip().lower()
+    s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9\-]+", "-", s)
     s = re.sub(r"-{2,}", "-", s).strip("-")
-    return s[:60] or "run"
+    return (s[:60] or "run")
 
 
 def _clamp_int(val: int, lo: int, hi: int) -> int:
     try:
-        val = int(val)
+        v = int(val)
     except Exception:
         return lo
-    return max(lo, min(hi, val))
+    return max(lo, min(hi, v))
 
 
 def _validate_model_type(model_type: str) -> bool:
@@ -71,11 +71,22 @@ def _validate_model_type(model_type: str) -> bool:
 
 
 def _validate_model_name(model_name: str) -> bool:
-    return bool(_MODEL_NAME_RE.match(model_name))
+    return bool(_MODEL_NAME_RE.match(model_name or ""))
+
+
+def _mask(s: str, keep: int = 4) -> str:
+    if not s:
+        return ""
+    if len(s) <= keep:
+        return "*" * len(s)
+    return "*" * (len(s) - keep) + s[-keep:]
 
 
 def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
-    # Streamlit Cloud uses st.secrets; locally you can use env vars as fallback.
+    """
+    Streamlit Cloud: secrets are in st.secrets (not automatically exported to env).
+    Local dev: can fallback to environment variables.
+    """
     try:
         if name in st.secrets:
             return str(st.secrets[name])
@@ -84,10 +95,19 @@ def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(name, default)
 
 
+def _export_api_keys_to_env(api_keys: Dict[str, str]) -> None:
+    """
+    Ensure keys are available to subprocesses (garak runs in a subprocess).
+    """
+    for k, v in (api_keys or {}).items():
+        if v:
+            os.environ[k] = v
+
+
 def _auth_gate() -> None:
     """
     Optional password gate. Set APP_PASSWORD in Streamlit Secrets or env.
-    If unset, the app is open (use Streamlit Cloud's access controls if needed).
+    If unset, the app is open.
     """
     app_password = _get_secret("APP_PASSWORD")
     if not app_password:
@@ -104,15 +124,15 @@ def _auth_gate() -> None:
             st.success("Unlocked.")
             st.rerun()
         else:
-            st.error("Nope.")
+            st.error("Incorrect password.")
     st.stop()
 
 
 def _rate_limit(min_seconds: float = 10.0) -> None:
     """
-    Very small per-session rate limiter to avoid accidental DoS of paid APIs.
+    Very small per-session rate limiter to avoid accidental API spam.
     """
-    last = st.session_state.get("last_run_ts", 0.0)
+    last = float(st.session_state.get("last_run_ts", 0.0))
     now = time.time()
     if now - last < min_seconds:
         st.error(f"Rate limit: wait {min_seconds - (now - last):.1f}s before running again.")
@@ -123,34 +143,36 @@ def _rate_limit(min_seconds: float = 10.0) -> None:
 def _resolve_api_keys(provider: str) -> Dict[str, str]:
     """
     Pull provider keys from Streamlit Secrets or env.
-    We DO NOT ask users to paste keys into the UI (keys could land in browser history).
+    No UI entry for keys (avoid browser history / accidental leaks).
     """
     keys: Dict[str, str] = {}
 
-    # common keys used by garak providers
     if provider == "openai":
         v = _get_secret("OPENAI_API_KEY")
         if v:
             keys["OPENAI_API_KEY"] = v
+
     elif provider == "anthropic":
         v = _get_secret("ANTHROPIC_API_KEY")
         if v:
             keys["ANTHROPIC_API_KEY"] = v
+
     elif provider == "google":
         v = _get_secret("GOOGLE_API_KEY") or _get_secret("GEMINI_API_KEY")
         if v:
-            # google-generativeai uses GOOGLE_API_KEY commonly
             keys["GOOGLE_API_KEY"] = v
+
     elif provider == "cohere":
         v = _get_secret("COHERE_API_KEY")
         if v:
             keys["COHERE_API_KEY"] = v
+
     elif provider == "replicate":
         v = _get_secret("REPLICATE_API_TOKEN")
         if v:
             keys["REPLICATE_API_TOKEN"] = v
 
-    # Optional Perspective key used by some toxicity detectors
+    # Optional key used by some toxicity-related detectors
     v = _get_secret("PERSPECTIVE_API_KEY")
     if v:
         keys["PERSPECTIVE_API_KEY"] = v
@@ -165,15 +187,15 @@ def _provider_hint(provider: str) -> str:
         "google": "Needs GOOGLE_API_KEY (or GEMINI_API_KEY)",
         "cohere": "Needs COHERE_API_KEY",
         "replicate": "Needs REPLICATE_API_TOKEN",
-        "huggingface": "Usually local/inference endpoint; may need HF_TOKEN depending on your setup",
-        "ollama": "Runs locally; not supported on Streamlit Cloud unless you host Ollama elsewhere",
+        "huggingface": "May need HF_TOKEN depending on your setup",
+        "ollama": "Local only (Streamlit Cloud won't run Ollama locally)",
         "test": "No keys needed",
     }
     return hints.get(provider, "")
 
 
 # -----------------------------
-# UI components
+# UI helpers
 # -----------------------------
 
 def _sidebar_branding() -> None:
@@ -183,21 +205,23 @@ def _sidebar_branding() -> None:
 
 
 def _select_model(registry: ModelRegistry) -> Tuple[str, str, Optional[ModelInfo]]:
-    providers = registry.get_all_providers()
-    # Only show providers we can support in this Streamlit context
-    providers = [p for p in providers if p in _ALLOWED_MODEL_TYPES]
+    providers = [p for p in registry.get_all_providers() if p in _ALLOWED_MODEL_TYPES]
+    if not providers:
+        providers = ["test"]
 
-    provider = st.sidebar.selectbox("Provider", providers, index=providers.index("openai") if "openai" in providers else 0)
+    default_provider_idx = providers.index("openai") if "openai" in providers else 0
+    provider = st.sidebar.selectbox("Provider", providers, index=default_provider_idx)
     st.sidebar.caption(_provider_hint(provider))
 
     models = registry.get_models_by_provider(provider)
-    names = [m.name for m in models]
-    display = [f"{m.display_name} ({m.name})" for m in models]
+    if not models:
+        # fallback
+        return provider, "test", None
 
-    model_choice = st.sidebar.selectbox("Model", display, index=0 if display else None)
-    model_name = names[display.index(model_choice)] if display else "test"
-    model_info = registry.get_model_info(provider, model_name)
-    return provider, model_name, model_info
+    display = [f"{m.display_name} ({m.name})" for m in models]
+    choice = st.sidebar.selectbox("Model", display, index=0)
+    picked = models[display.index(choice)]
+    return provider, picked.name, registry.get_model_info(provider, picked.name)
 
 
 def _select_scan_categories() -> List[ScanCategory]:
@@ -212,19 +236,17 @@ def _select_scan_categories() -> List[ScanCategory]:
         ("Encoding", ScanCategory.ENCODING),
     ]
     labels = [o[0] for o in opts]
-    default = ["Jailbreaks", "Prompt injection", "Data leakage"]
+    default = ["Jailbreaks", "Prompt injection", "Data leakage", "Toxicity"]
     picked = st.multiselect("Scan categories", labels, default=default)
     selected = [cat for lbl, cat in opts if lbl in picked]
-    if not selected:
-        selected = [ScanCategory.JAILBREAKS]
-    return selected
+    return selected or [ScanCategory.JAILBREAKS]
 
 
 def _scan_safety_controls() -> Tuple[int, int, int]:
     st.subheader("Safety limits")
     col1, col2, col3 = st.columns(3)
     with col1:
-        generations = st.number_input("Generations / probe", min_value=1, max_value=20, value=5, step=1)
+        generations = st.number_input("Generations / probe", min_value=1, max_value=20, value=3, step=1)
     with col2:
         timeout = st.number_input("Timeout (sec) / batch", min_value=60, max_value=7200, value=1200, step=60)
     with col3:
@@ -239,8 +261,7 @@ def _run_dir(provider: str, model_name: str) -> Path:
     return out
 
 
-def _read_latest_reports(run_dir: Path) -> Dict[str, List[Path]]:
-    # Garak writes .jsonl and html reports with the prefix
+def _read_reports(run_dir: Path) -> Dict[str, List[Path]]:
     jsonl = sorted(run_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     html = sorted(run_dir.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
     md = sorted(run_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -250,15 +271,17 @@ def _read_latest_reports(run_dir: Path) -> Dict[str, List[Path]]:
 
 def _render_results(run_dir: Path) -> None:
     st.subheader("Artifacts")
-    reports = _read_latest_reports(run_dir)
+    reports = _read_reports(run_dir)
 
     cols = st.columns(2)
     with cols[0]:
         st.write("Files in run directory:")
-        st.code("\n".join([p.name for p in sorted(run_dir.iterdir())]) or "(none)")
+        try:
+            st.code("\n".join([p.name for p in sorted(run_dir.iterdir())]) or "(none)")
+        except Exception:
+            st.code("(unable to list files)")
 
     with cols[1]:
-        # Provide download buttons for top artifacts
         for kind in ("md", "json", "html"):
             if reports[kind]:
                 p = reports[kind][0]
@@ -269,14 +292,18 @@ def _render_results(run_dir: Path) -> None:
                     mime="text/plain" if kind in ("md", "json") else "text/html",
                 )
 
-    # Show a quick JSON summary if available
+    # quick summary if our wrapper JSON exists
     if reports["json"]:
-        try:
-            summary = json.loads(reports["json"][0].read_text())
-            st.subheader("Run summary")
-            st.json(summary.get("summary", summary))
-        except Exception:
-            pass
+        for p in reports["json"]:
+            # Prefer scan_results_*.json (contains summary), fall back to run_metadata.json
+            if p.name.startswith("scan_results_") or p.name == "run_metadata.json":
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    st.subheader("Run summary")
+                    st.json(data.get("summary", data))
+                except Exception:
+                    pass
+                break
 
 
 # -----------------------------
@@ -285,7 +312,6 @@ def _render_results(run_dir: Path) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="SecureLLM", layout="wide")
-
     _auth_gate()
 
     registry = ModelRegistry()
@@ -296,17 +322,17 @@ def main() -> None:
 
     st.title("SecureLLM")
     st.caption("A Streamlit front-end for Garak-based LLM red teaming. Be nice to your API bill.")
+    st.divider()
 
-    # Show model info
+    # Model details
     if model_info:
         with st.expander("Selected model details", expanded=False):
             st.write(f"**Name:** {model_info.display_name}")
             st.write(f"**Provider:** {model_info.provider}")
             st.write(f"**Context window:** {model_info.context_window or 'N/A'}")
             st.write(f"**Cost tier:** {model_info.cost_tier or 'N/A'}")
-            st.write(model_info.description)
-
-    st.divider()
+            if model_info.description:
+                st.write(model_info.description)
 
     colA, colB = st.columns([1, 1])
     with colA:
@@ -314,18 +340,20 @@ def main() -> None:
     with colB:
         generations, timeout, parallel = _scan_safety_controls()
 
-    # Advanced: probe overrides (still constrained)
+    # Advanced exclusions
     with st.expander("Advanced probe selection (optional)", expanded=False):
-        st.caption("You can exclude noisy probes. Custom probes are not enabled in the hosted app for safety.")
-        all_probes = sorted({p for cat in [c.value for c in categories] for p in probe_registry.get_probes_by_category([ScanCategory(cat)])} if categories else set())
-        # Fallback: if category list includes COMPREHENSIVE, this can be big.
+        st.caption("Exclude noisy probes. (Custom probes are disabled in hosted mode.)")
         if ScanCategory.COMPREHENSIVE in categories:
             all_probes = sorted(set(probe_registry.get_probes_by_category([ScanCategory.COMPREHENSIVE])))
-        exclude = st.multiselect("Exclude probes", all_probes, default=["test.Test"] if "test.Test" in all_probes else [])
+        else:
+            all_probes = sorted(set(probe_registry.get_probes_by_category(categories)))
+
+        default_exclude = ["test.Test"] if "test.Test" in all_probes else []
+        exclude = st.multiselect("Exclude probes", all_probes, default=default_exclude)
 
     st.divider()
 
-    # Validate inputs
+    # Validate inputs early
     if not _validate_model_type(provider):
         st.error("Unsupported provider.")
         st.stop()
@@ -333,10 +361,11 @@ def main() -> None:
         st.error("Model name failed validation.")
         st.stop()
 
-    # Ensure we have keys where necessary
     api_keys = _resolve_api_keys(provider)
     needs_key = provider in {"openai", "anthropic", "google", "cohere", "replicate"}
-    if needs_key and not api_keys:
+    missing_key = needs_key and not api_keys
+
+    if missing_key:
         st.warning(
             "No API key detected for this provider. Add it in Streamlit Secrets "
             "(recommended) or as an environment variable."
@@ -356,18 +385,32 @@ def main() -> None:
                 )
             )
 
-    run_btn = st.button("Run scan", type="primary", use_container_width=True)
+    with st.expander("Key diagnostics (masked)", expanded=False):
+        if api_keys:
+            st.write({k: _mask(v) for k, v in api_keys.items()})
+        else:
+            st.write("(no keys detected)")
+
+    run_btn = st.button(
+        "Run scan",
+        type="primary",
+        use_container_width=True,
+        disabled=missing_key,
+    )
 
     if run_btn:
         _rate_limit(10.0)
 
-        run_dir = _run_dir(provider, model_name)
-        report_prefix = "garak_scan"
-
-        # Clamp safety parameters (defense-in-depth)
+        # Clamp safety limits (defense-in-depth)
         generations = _clamp_int(generations, 1, 20)
         timeout = _clamp_int(timeout, 60, 7200)
         parallel = _clamp_int(parallel, 1, 4)
+
+        run_dir = _run_dir(provider, model_name)
+        report_prefix = "garak_scan"
+
+        # Export keys so subprocesses definitely see them
+        _export_api_keys_to_env(api_keys)
 
         config = ScanConfig(
             target_model=model_name,
@@ -380,7 +423,7 @@ def main() -> None:
             parallel_probes=parallel,
             custom_probes=None,  # disabled in hosted mode
             exclude_probes=exclude or None,
-            api_keys=api_keys or None,
+            api_keys=api_keys or None,  # wrapper also exports, but keep for completeness
         )
 
         st.info(f"Run directory: {run_dir}")
@@ -392,19 +435,36 @@ def main() -> None:
             try:
                 results = scanner.run_comprehensive_scan()
                 st.success("Scan completed.")
-                # Persist a small run metadata file for convenience
-                meta = {"provider": provider, "model": model_name, "run_dir": str(run_dir), "summary": results.get("summary", {})}
-                (run_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2))
+
+                # Persist small run metadata for the “Recent runs” list
+                meta = {
+                    "provider": provider,
+                    "model": model_name,
+                    "run_dir": str(run_dir),
+                    "categories": [c.value for c in categories],
+                    "summary": results.get("summary", {}),
+                }
+                (run_dir / "run_metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
                 _render_results(run_dir)
+
             except Exception as e:
                 st.error(f"Scan failed: {e}")
-                # Show a redacted snippet for debugging without leaking secrets
-                st.caption("Tip: verify garak is installed and the provider key is set in Streamlit Secrets.")
+                st.caption("Tip: confirm provider key is set in Streamlit Secrets and garak is installed.")
 
-    # Show previous runs on this instance (best-effort; ephemeral on Streamlit Cloud)
+    # Recent runs (best-effort; ephemeral on Streamlit Cloud)
     st.divider()
     st.subheader("Recent runs on this server")
-    runs = sorted([p for p in DEFAULT_OUTPUT_ROOT.glob("*") if p.is_dir()], key=lambda p: p.stat().st_mtime, reverse=True)[:10]
+
+    try:
+        runs = sorted(
+            [p for p in DEFAULT_OUTPUT_ROOT.glob("*") if p.is_dir()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:10]
+    except Exception:
+        runs = []
+
     if not runs:
         st.caption("No runs yet.")
     else:
@@ -413,9 +473,13 @@ def main() -> None:
                 meta = p / "run_metadata.json"
                 if meta.exists():
                     try:
-                        st.json(json.loads(meta.read_text()))
+                        st.json(json.loads(meta.read_text(encoding="utf-8")))
                     except Exception:
                         pass
                 st.write(f"Path: {p}")
                 if st.button(f"Show artifacts for {p.name}", key=f"show_{p.name}"):
                     _render_results(p)
+
+
+if __name__ == "__main__":
+    main()
